@@ -262,6 +262,45 @@ async def cmd_getaccount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Check if an account is even available before asking for number
+    account = await db.get_available_account()
+    if not account:
+        await update.message.reply_text(
+            "❌ *No accounts available right now.*\n"
+            "Please contact an admin.",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Ask for mobile number first
+    context.user_data["waiting_for_mobile"] = True
+    await update.message.reply_text(
+        "📱 *Please enter your mobile number* to proceed:\n\n"
+        "Example: `+91 9876543210`",
+        parse_mode="Markdown"
+    )
+
+
+async def handle_mobile_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle mobile number submitted before account assignment."""
+    if not context.user_data.get("waiting_for_mobile"):
+        return
+
+    user_id = update.effective_user.id
+    mobile = update.message.text.strip()
+
+    # Basic validation — must have at least 7 digits
+    digits = ''.join(c for c in mobile if c.isdigit())
+    if len(digits) < 7:
+        await update.message.reply_text(
+            "❌ Invalid mobile number. Please enter a valid number.\n"
+            "Example: `+91 9876543210`",
+            parse_mode="Markdown"
+        )
+        return
+
+    context.user_data["waiting_for_mobile"] = False
+
     # Get available account
     account = await db.get_available_account()
     if not account:
@@ -276,9 +315,11 @@ async def cmd_getaccount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await db.assign_account(account["account_id"], user_id)
     otp, remaining = generate_otp(account["totp_secret"])
 
-    # Send via DM if command used in group
-    target = update.effective_chat
-    await target.send_message(
+    user = update.effective_user
+    username = f"@{user.username}" if user.username else f"ID: {user_id}"
+
+    # Send account details to user
+    await update.message.reply_text(
         f"✅ *Account Assigned to You!*\n\n"
         f"🆔 *Account ID:* `{account['account_id']}`\n"
         f"🔑 *Password:* `{account['password']}`\n"
@@ -289,7 +330,31 @@ async def cmd_getaccount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-    logger.info(f"Account {account['account_id']} assigned to user {user_id}")
+    # Notify all admins
+    all_admin_ids = list(ADMIN_IDS)
+    db_admins = await db.get_admins()
+    for a in db_admins:
+        if a["user_id"] not in all_admin_ids:
+            all_admin_ids.append(a["user_id"])
+
+    for admin_id in all_admin_ids:
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=(
+                    f"📋 *New Account Assignment*\n\n"
+                    f"👤 User: {username} (`{user_id}`)\n"
+                    f"📱 Mobile: `{mobile}`\n"
+                    f"🆔 Account: `{account['account_id']}`\n"
+                    f"🔑 Password: `{account['password']}`\n"
+                    f"⏰ Assigned: just now"
+                ),
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+
+    logger.info(f"Account {account['account_id']} assigned to user {user_id} ({mobile})")
 
 
 async def cmd_myotp(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -748,6 +813,14 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
+async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Route text input to the right handler based on user state."""
+    if context.user_data.get("waiting_for_mobile"):
+        await handle_mobile_number(update, context)
+    elif context.user_data.get("waiting_for_txn"):
+        await handle_txn_id(update, context)
+
+
 # --- App Setup ---
 
 async def post_init(application: Application):
@@ -838,7 +911,7 @@ def main():
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
     # TXN ID handler (text messages from users waiting after /done)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_txn_id))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
