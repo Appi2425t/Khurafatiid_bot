@@ -24,7 +24,8 @@ class Database:
                     totp_secret TEXT NOT NULL,
                     status TEXT DEFAULT 'available',
                     assigned_to INTEGER,
-                    assigned_at TIMESTAMP
+                    assigned_at TIMESTAMP,
+                    otp_shown INTEGER DEFAULT 0
                 )
             """)
             await db.execute("""
@@ -47,6 +48,15 @@ class Database:
                     address TEXT NOT NULL,
                     network TEXT DEFAULT 'USDT TRC20',
                     active INTEGER DEFAULT 1
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS admin_contact (
+                    id INTEGER PRIMARY KEY,
+                    telegram TEXT,
+                    phone TEXT,
+                    note TEXT,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
             await db.commit()
@@ -174,6 +184,34 @@ class Database:
             cursor = await db.execute("SELECT user_id FROM admins WHERE user_id = ?", (user_id,))
             return await cursor.fetchone() is not None
 
+    async def mark_otp_shown(self, account_id: str):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("UPDATE accounts SET otp_shown = 1 WHERE account_id = ?", (account_id,))
+            await db.commit()
+
+    async def run_migrations(self):
+        """Add new columns to existing databases."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("PRAGMA table_info(accounts)")
+            cols = [row[1] for row in await cursor.fetchall()]
+            if "otp_shown" not in cols:
+                await db.execute("ALTER TABLE accounts ADD COLUMN otp_shown INTEGER DEFAULT 0")
+            cursor = await db.execute("PRAGMA table_info(withdraw_wallets)")
+            cols = [row[1] for row in await cursor.fetchall()]
+            # check admin_contact table exists
+            cursor = await db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='admin_contact'")
+            if not await cursor.fetchone():
+                await db.execute("""
+                    CREATE TABLE IF NOT EXISTS admin_contact (
+                        id INTEGER PRIMARY KEY,
+                        telegram TEXT,
+                        phone TEXT,
+                        note TEXT,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+            await db.commit()
+
     # --- Withdraw Wallets ---
     async def get_active_wallet(self) -> dict:
         async with aiosqlite.connect(self.db_path) as db:
@@ -263,5 +301,24 @@ class Database:
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM withdrawals WHERE id = ?", (withdrawal_id,))
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    # --- Admin Contact ---
+    async def set_admin_contact(self, telegram: str = None, phone: str = None, note: str = None):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """INSERT INTO admin_contact (id, telegram, phone, note, updated_at)
+                   VALUES (1, ?, ?, ?, CURRENT_TIMESTAMP)
+                   ON CONFLICT(id) DO UPDATE SET
+                   telegram = ?, phone = ?, note = ?, updated_at = CURRENT_TIMESTAMP""",
+                (telegram, phone, note, telegram, phone, note)
+            )
+            await db.commit()
+
+    async def get_admin_contact(self) -> dict:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM admin_contact WHERE id = 1")
             row = await cursor.fetchone()
             return dict(row) if row else None

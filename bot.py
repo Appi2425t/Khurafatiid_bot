@@ -325,10 +325,13 @@ async def handle_mobile_number(update: Update, context: ContextTypes.DEFAULT_TYP
         f"🔑 *Password:* `{account['password']}`\n"
         f"🔐 *OTP Code:* `{otp}`\n"
         f"⏱ *OTP Expires in:* {remaining}s\n\n"
-        f"Use /myotp to get a fresh OTP anytime.\n"
-        f"⚠️ Keep these credentials private!",
+        f"⚠️ This is your *one-time OTP*. Save it now.\n"
+        f"For further OTP assistance, contact admin via /adcm.",
         parse_mode="Markdown"
     )
+
+    # Mark OTP as shown
+    await db.mark_otp_shown(account["account_id"])
 
     # Notify all admins
     all_admin_ids = list(ADMIN_IDS)
@@ -369,13 +372,33 @@ async def cmd_myotp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Block if OTP already shown once
+    if account.get("otp_shown", 0):
+        contact = await db.get_admin_contact()
+        contact_text = ""
+        if contact:
+            if contact.get("telegram"):
+                contact_text += f"\n📱 Telegram: {contact['telegram']}"
+            if contact.get("phone"):
+                contact_text += f"\n📞 Phone: `{contact['phone']}`"
+            if contact.get("note"):
+                contact_text += f"\nℹ️ {contact['note']}"
+        await update.message.reply_text(
+            f"⚠️ *OTP already provided once.*\n\n"
+            f"For security, OTP can only be shown once per account.\n"
+            f"Please contact admin for further assistance.{contact_text}",
+            parse_mode="Markdown"
+        )
+        return
+
     otp, remaining = generate_otp(account["totp_secret"])
+    await db.mark_otp_shown(account["account_id"])
     await update.message.reply_text(
-        f"🔐 *Your Current OTP*\n\n"
+        f"🔐 *Your OTP Code*\n\n"
         f"🆔 Account: `{account['account_id']}`\n"
         f"🔢 *Code:* `{otp}`\n"
         f"⏱ *Valid for:* {remaining} seconds\n\n"
-        f"Run /myotp again after 30s for a new code.",
+        f"⚠️ This is your *last OTP*. Contact admin for more help.",
         parse_mode="Markdown"
     )
 
@@ -813,6 +836,65 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
+async def cmd_adcm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin sets contact info. Usage: /adcm"""
+    if not await is_admin_full(update.effective_user.id):
+        # Show contact info to users
+        contact = await db.get_admin_contact()
+        if not contact:
+            await update.message.reply_text("ℹ️ Admin contact not set yet. Please try later.")
+            return
+        text = "📞 *Contact Admin*\n"
+        if contact.get("telegram"):
+            text += f"\n📱 Telegram: {contact['telegram']}"
+        if contact.get("phone"):
+            text += f"\n☎️ Phone: `{contact['phone']}`"
+        if contact.get("note"):
+            text += f"\nℹ️ {contact['note']}"
+        await update.message.reply_text(text, parse_mode="Markdown")
+        return
+
+    # Admin setting contact info
+    if not context.args:
+        contact = await db.get_admin_contact()
+        current = ""
+        if contact:
+            current = (
+                f"\n\n*Current Contact:*\n"
+                f"Telegram: {contact.get('telegram') or 'Not set'}\n"
+                f"Phone: {contact.get('phone') or 'Not set'}\n"
+                f"Note: {contact.get('note') or 'Not set'}"
+            )
+        await update.message.reply_text(
+            f"Usage: `/adcm <telegram> <phone> [note]`\n\n"
+            f"Examples:\n"
+            f"`/adcm @adminuser +91999999 Contact for OTP help`\n"
+            f"`/adcm @adminuser none Support available 9am-9pm`{current}",
+            parse_mode="Markdown"
+        )
+        return
+
+    telegram = context.args[0] if len(context.args) >= 1 else None
+    phone = context.args[1] if len(context.args) >= 2 else None
+    note = " ".join(context.args[2:]) if len(context.args) > 2 else None
+
+    # Handle "none" values
+    if telegram and telegram.lower() == "none":
+        telegram = None
+    if phone and phone.lower() == "none":
+        phone = None
+
+    await db.set_admin_contact(telegram, phone, note)
+    await update.message.reply_text(
+        f"✅ *Admin contact updated!*\n\n"
+        f"📱 Telegram: {telegram or 'Not set'}\n"
+        f"☎️ Phone: {phone or 'Not set'}\n"
+        f"ℹ️ Note: {note or 'Not set'}\n\n"
+        f"Users will see this when they run /adcm or ask for OTP help.",
+        parse_mode="Markdown"
+    )
+
+
 async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Route text input to the right handler based on user state."""
     if context.user_data.get("waiting_for_mobile"):
@@ -825,14 +907,16 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def post_init(application: Application):
     await db.init()
+    await db.run_migrations()
 
     # User-facing commands (shown to everyone)
     user_cmds = [
         BotCommand("start", "Welcome message"),
         BotCommand("getaccount", "Get an available account with OTP"),
-        BotCommand("myotp", "Refresh your current OTP code"),
+        BotCommand("myotp", "View your one-time OTP code"),
         BotCommand("myaccount", "View your account details"),
         BotCommand("done", "Withdraw earnings & release account"),
+        BotCommand("adcm", "Contact admin for help"),
         BotCommand("help", "Show all commands"),
     ]
     await application.bot.set_my_commands(user_cmds)
@@ -890,6 +974,7 @@ def main():
     app.add_handler(CommandHandler("myotp", cmd_myotp))
     app.add_handler(CommandHandler("myaccount", cmd_myaccount))
     app.add_handler(CommandHandler("done", cmd_done))
+    app.add_handler(CommandHandler("adcm", cmd_adcm))
 
     # Admin commands
     app.add_handler(CommandHandler("upload", cmd_upload))
