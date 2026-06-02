@@ -681,6 +681,51 @@ async def cmd_wallets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_adotp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin gets OTP for any account by ID. Usage: /adotp <account_id>"""
+    if not await is_admin_full(update.effective_user.id):
+        await update.message.reply_text("❌ Admin only.")
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: `/adotp <account_id>`\n\n"
+            "Example: `/adotp user@example.com`",
+            parse_mode="Markdown"
+        )
+        return
+
+    account_id = " ".join(context.args).strip()
+
+    # Fetch account from DB
+    import aiosqlite as _aiosqlite
+    async with _aiosqlite.connect(db.db_path) as conn:
+        conn.row_factory = _aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT * FROM accounts WHERE account_id = ?", (account_id,)
+        )
+        row = await cursor.fetchone()
+
+    if not row:
+        await update.message.reply_text(
+            f"❌ Account `{account_id}` not found in database.",
+            parse_mode="Markdown"
+        )
+        return
+
+    account = dict(row)
+    otp, remaining = generate_otp(account["totp_secret"])
+
+    await update.message.reply_text(
+        f"🔐 *OTP for Account*\n\n"
+        f"🆔 Account: `{account['account_id']}`\n"
+        f"🔢 *OTP Code:* `{otp}`\n"
+        f"⏱ *Valid for:* {remaining} seconds\n"
+        f"📊 Status: `{account['status']}`\n"
+        f"👤 Assigned to: `{account.get('assigned_to') or 'Nobody'}`",
+        parse_mode="Markdown"
+    )
+
+
 async def cmd_addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin_full(update.effective_user.id):
         await update.message.reply_text("❌ Admin only.")
@@ -983,6 +1028,7 @@ def main():
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("resetaccount", cmd_resetaccount))
     app.add_handler(CommandHandler("remove", cmd_remove))
+    app.add_handler(CommandHandler("adotp", cmd_adotp))
     app.add_handler(CommandHandler("addadmin", cmd_addadmin))
     app.add_handler(CommandHandler("removeadmin", cmd_removeadmin))
     app.add_handler(CommandHandler("admins", cmd_admins))
