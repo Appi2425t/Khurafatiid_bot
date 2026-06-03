@@ -66,6 +66,15 @@ class Database:
                     chat_id INTEGER NOT NULL
                 )
             """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS allowed_users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    phone TEXT NOT NULL UNIQUE,
+                    name TEXT NOT NULL,
+                    used INTEGER DEFAULT 0,
+                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
             await db.commit()
 
     # --- Account CRUD ---
@@ -227,6 +236,19 @@ class Database:
                     )
                 """)
 
+            # check allowed_users table exists
+            cursor = await db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='allowed_users'")
+            if not await cursor.fetchone():
+                await db.execute("""
+                    CREATE TABLE IF NOT EXISTS allowed_users (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        phone TEXT NOT NULL UNIQUE,
+                        name TEXT NOT NULL,
+                        used INTEGER DEFAULT 0,
+                        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+
             # check withdrawals screenshot column
             cursor = await db.execute("PRAGMA table_info(withdrawals)")
             cols = [row[1] for row in await cursor.fetchall()]
@@ -368,4 +390,59 @@ class Database:
                    ON CONFLICT(id) DO UPDATE SET chat_id = ?""",
                 (chat_id, chat_id)
             )
+            await db.commit()
+
+    # --- Allowed Users (Phone Whitelist) ---
+    async def check_allowed_phone(self, phone: str) -> dict:
+        """Normalize and check if phone is in whitelist. Returns user dict or None."""
+        normalized = ''.join(c for c in phone if c.isdigit())
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            # Match last 10 digits to handle country code variations
+            cursor = await db.execute("SELECT * FROM allowed_users")
+            rows = await cursor.fetchall()
+            for row in rows:
+                stored = ''.join(c for c in row["phone"] if c.isdigit())
+                # Match if last 10 digits are same
+                if normalized[-10:] == stored[-10:]:
+                    return dict(row)
+            return None
+
+    async def mark_phone_used(self, phone: str):
+        normalized = ''.join(c for c in phone if c.isdigit())
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("SELECT * FROM allowed_users")
+            rows = await cursor.fetchall()
+            for row in rows:
+                stored = ''.join(c for c in row["phone"] if c.isdigit())
+                if normalized[-10:] == stored[-10:]:
+                    await db.execute("UPDATE allowed_users SET used = 1 WHERE id = ?", (row[0],))
+                    await db.commit()
+                    return
+
+    async def get_all_allowed_users(self) -> list:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM allowed_users ORDER BY id ASC")
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+
+    async def upsert_allowed_user(self, phone: str, name: str):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """INSERT INTO allowed_users (phone, name) VALUES (?, ?)
+                   ON CONFLICT(phone) DO UPDATE SET name = ?""",
+                (phone, name, name)
+            )
+            await db.commit()
+
+    async def remove_allowed_user(self, phone: str) -> bool:
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("DELETE FROM allowed_users WHERE phone = ?", (phone,))
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def clear_allowed_users(self):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("DELETE FROM allowed_users")
             await db.commit()

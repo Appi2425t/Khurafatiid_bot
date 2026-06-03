@@ -76,6 +76,26 @@ def parse_excel(file_bytes: bytes) -> list[dict]:
     return accounts
 
 
+def parse_users_excel(file_bytes: bytes) -> list[dict]:
+    """Parse Excel file with Phone and Name columns."""
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
+    ws = wb.active
+    headers = []
+    users = []
+    for i, row in enumerate(ws.iter_rows(values_only=True)):
+        if i == 0:
+            headers = [str(h).strip().lower() if h else "" for h in row]
+            continue
+        if not any(row):
+            continue
+        row_dict = dict(zip(headers, row))
+        phone = str(row_dict.get("phone") or row_dict.get("mobile") or row_dict.get("number") or "").strip()
+        name = str(row_dict.get("name") or row_dict.get("full name") or row_dict.get("fullname") or "").strip()
+        if phone and name:
+            users.append({"phone": phone, "name": name})
+    return users
+
+
 # --- Admin Commands ---
 
 async def cmd_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -95,12 +115,17 @@ async def cmd_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin_full(update.effective_user.id):
         return
-    if not context.user_data.get("waiting_for_upload"):
-        return
 
     doc = update.message.document
     if not doc.file_name.endswith(".xlsx"):
         await update.message.reply_text("❌ Please upload a `.xlsx` file.")
+        return
+
+    # Determine which upload mode
+    waiting_accounts = context.user_data.get("waiting_for_upload")
+    waiting_users = context.user_data.get("waiting_for_users_upload")
+
+    if not waiting_accounts and not waiting_users:
         return
 
     await update.message.reply_text("⏳ Processing file...")
@@ -108,39 +133,68 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         file = await doc.get_file()
         file_bytes = await file.download_as_bytearray()
-        accounts = parse_excel(bytes(file_bytes))
     except Exception as e:
-        await update.message.reply_text(f"❌ Failed to parse file: {e}")
+        await update.message.reply_text(f"❌ Failed to download file: {e}")
         return
 
-    if not accounts:
+    if waiting_accounts:
+        # Parse accounts Excel
+        try:
+            accounts = parse_excel(bytes(file_bytes))
+        except Exception as e:
+            await update.message.reply_text(f"❌ Failed to parse file: {e}")
+            return
+
+        if not accounts:
+            await update.message.reply_text(
+                "❌ No valid accounts found.\n"
+                "Make sure columns are: `ID`, `Password`, `TOTP Secret`"
+            )
+            return
+
+        added = updated = 0
+        existing_ids = [a["account_id"] for a in await db.get_all_accounts()]
+        for acc in accounts:
+            if acc["id"] in existing_ids:
+                updated += 1
+            else:
+                added += 1
+            await db.upsert_account(acc["id"], acc["password"], acc["totp_secret"])
+
+        context.user_data["waiting_for_upload"] = False
+        stats = await db.get_stats()
         await update.message.reply_text(
-            "❌ No valid accounts found.\n"
-            "Make sure columns are named: `ID`, `Password`, `TOTP Secret`"
+            f"✅ *Accounts Upload Complete!*\n\n"
+            f"📥 Added: {added} | 🔄 Updated: {updated}\n"
+            f"📊 Total: {stats['total']} | Available: {stats['available']} | Assigned: {stats['assigned']}",
+            parse_mode="Markdown"
         )
-        return
 
-    added = 0
-    updated = 0
-    for acc in accounts:
-        existing = await db.get_all_accounts()
-        existing_ids = [a["account_id"] for a in existing]
-        if acc["id"] in existing_ids:
-            updated += 1
-        else:
-            added += 1
-        await db.upsert_account(acc["id"], acc["password"], acc["totp_secret"])
+    elif waiting_users:
+        # Parse users Excel
+        try:
+            users = parse_users_excel(bytes(file_bytes))
+        except Exception as e:
+            await update.message.reply_text(f"❌ Failed to parse file: {e}")
+            return
 
-    context.user_data["waiting_for_upload"] = False
-    stats = await db.get_stats()
+        if not users:
+            await update.message.reply_text(
+                "❌ No valid users found.\n"
+                "Make sure columns are: `Phone`, `Name`"
+            )
+            return
 
-    await update.message.reply_text(
-        f"✅ *Upload Complete!*\n\n"
-        f"📥 Added: {added} new accounts\n"
-        f"🔄 Updated: {updated} existing accounts\n\n"
-        f"📊 Total: {stats['total']} | Available: {stats['available']} | Assigned: {stats['assigned']}",
-        parse_mode="Markdown"
-    )
+        for u in users:
+            await db.upsert_allowed_user(u["phone"], u["name"])
+
+        context.user_data["waiting_for_users_upload"] = False
+        await update.message.reply_text(
+            f"✅ *User List Upload Complete!*\n\n"
+            f"👥 {len(users)} users added/updated in whitelist.\n"
+            f"Use /listusers to view them.",
+            parse_mode="Markdown"
+        )
 
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -299,6 +353,18 @@ async def handle_mobile_number(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
+    # Check whitelist
+    allowed = await db.check_allowed_phone(mobile)
+    if allowed is None:
+        await update.message.reply_text(
+            "❌ *Your number is not registered.*\n\n"
+            "Only registered users can receive accounts.\n"
+            "Please contact admin via /adcm.",
+            parse_mode="Markdown"
+        )
+        return
+
+    user_name = allowed["name"]
     context.user_data["waiting_for_mobile"] = False
 
     # Get available account
@@ -313,6 +379,7 @@ async def handle_mobile_number(update: Update, context: ContextTypes.DEFAULT_TYP
 
     # Assign it
     await db.assign_account(account["account_id"], user_id)
+    await db.mark_phone_used(mobile)
     otp, remaining = generate_otp(account["totp_secret"])
 
     user = update.effective_user
@@ -320,7 +387,8 @@ async def handle_mobile_number(update: Update, context: ContextTypes.DEFAULT_TYP
 
     # Send account details to user
     await update.message.reply_text(
-        f"✅ *Account Assigned to You!*\n\n"
+        f"✅ *Welcome, {user_name}!*\n\n"
+        f"*Account Assigned to You:*\n\n"
         f"🆔 *Account ID:* `{account['account_id']}`\n"
         f"🔑 *Password:* `{account['password']}`\n"
         f"🔐 *OTP Code:* `{otp}`\n"
@@ -333,31 +401,39 @@ async def handle_mobile_number(update: Update, context: ContextTypes.DEFAULT_TYP
     # Mark OTP as shown
     await db.mark_otp_shown(account["account_id"])
 
-    # Notify all admins
-    all_admin_ids = list(ADMIN_IDS)
-    db_admins = await db.get_admins()
-    for a in db_admins:
-        if a["user_id"] not in all_admin_ids:
-            all_admin_ids.append(a["user_id"])
+    # Notify all admins / group
+    notify_group_id = await db.get_notify_group_chat_id()
+    notification_text = (
+        f"📋 *New Account Assignment*\n\n"
+        f"👤 User: {username} (`{user_id}`)\n"
+        f"📝 Name: `{user_name}`\n"
+        f"📱 Mobile: `{mobile}`\n"
+        f"🆔 Account: `{account['account_id']}`\n"
+        f"🔑 Password: `{account['password']}`\n"
+        f"⏰ Assigned: just now"
+    )
 
-    for admin_id in all_admin_ids:
+    sent = False
+    if notify_group_id:
         try:
-            await context.bot.send_message(
-                chat_id=admin_id,
-                text=(
-                    f"📋 *New Account Assignment*\n\n"
-                    f"👤 User: {username} (`{user_id}`)\n"
-                    f"📱 Mobile: `{mobile}`\n"
-                    f"🆔 Account: `{account['account_id']}`\n"
-                    f"🔑 Password: `{account['password']}`\n"
-                    f"⏰ Assigned: just now"
-                ),
-                parse_mode="Markdown"
-            )
+            await context.bot.send_message(chat_id=notify_group_id, text=notification_text, parse_mode="Markdown")
+            sent = True
         except Exception:
             pass
 
-    logger.info(f"Account {account['account_id']} assigned to user {user_id} ({mobile})")
+    if not sent:
+        all_admin_ids = list(ADMIN_IDS)
+        db_admins = await db.get_admins()
+        for a in db_admins:
+            if a["user_id"] not in all_admin_ids:
+                all_admin_ids.append(a["user_id"])
+        for admin_id in all_admin_ids:
+            try:
+                await context.bot.send_message(chat_id=admin_id, text=notification_text, parse_mode="Markdown")
+            except Exception:
+                pass
+
+    logger.info(f"Account {account['account_id']} assigned to {user_name} ({mobile})")
 
 
 async def cmd_myotp(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -414,13 +490,11 @@ async def cmd_myaccount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    otp, remaining = generate_otp(account["totp_secret"])
     await update.message.reply_text(
         f"📋 *Your Account Details*\n\n"
         f"🆔 *Account ID:* `{account['account_id']}`\n"
         f"🔑 *Password:* `{account['password']}`\n"
-        f"🔐 *OTP Code:* `{otp}`\n"
-        f"⏱ *OTP Expires in:* {remaining}s",
+        f"📊 *Status:* `{account['status']}`",
         parse_mode="Markdown"
     )
 
@@ -715,6 +789,91 @@ async def cmd_wallets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_uploadusers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin uploads Excel with allowed phone numbers and names."""
+    if not await is_admin_full(update.effective_user.id):
+        await update.message.reply_text("❌ Admin only.")
+        return
+    await update.message.reply_text(
+        "📤 *Upload your user list Excel file.*\n\n"
+        "The file must have these columns:\n"
+        "`Phone` | `Name`\n\n"
+        "Example:\n"
+        "`+91 9876543210` | `Rahul Sharma`\n\n"
+        "Send the `.xlsx` file now.",
+        parse_mode="Markdown"
+    )
+    context.user_data["waiting_for_users_upload"] = True
+
+
+async def cmd_listusers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin views all allowed users."""
+    if not await is_admin_full(update.effective_user.id):
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    users = await db.get_all_allowed_users()
+    if not users:
+        await update.message.reply_text(
+            "📭 No users in whitelist.\n"
+            "Use /uploadusers to upload a list."
+        )
+        return
+
+    chunk_size = 30
+    chunks = [users[i:i+chunk_size] for i in range(0, len(users), chunk_size)]
+    for idx, chunk in enumerate(chunks):
+        lines = []
+        for u in chunk:
+            used = "✅" if u["used"] else "⬜"
+            lines.append(f"{used} `{u['phone']}` — {u['name']}")
+        header = f"👥 *Allowed Users ({len(users)} total)*\n\n" if idx == 0 else ""
+        await update.message.reply_text(header + "\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin adds a single user. Usage: /adduser <phone> <name>"""
+    if not await is_admin_full(update.effective_user.id):
+        await update.message.reply_text("❌ Admin only.")
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage: `/adduser <phone> <name>`\n"
+            "Example: `/adduser +919876543210 Rahul Sharma`",
+            parse_mode="Markdown"
+        )
+        return
+    phone = context.args[0]
+    name = " ".join(context.args[1:])
+    await db.upsert_allowed_user(phone, name)
+    await update.message.reply_text(f"✅ User added:\n📱 `{phone}` — {name}", parse_mode="Markdown")
+
+
+async def cmd_removeuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin removes a user from whitelist. Usage: /removeuser <phone>"""
+    if not await is_admin_full(update.effective_user.id):
+        await update.message.reply_text("❌ Admin only.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: `/removeuser <phone>`", parse_mode="Markdown")
+        return
+    phone = context.args[0]
+    success = await db.remove_allowed_user(phone)
+    if success:
+        await update.message.reply_text(f"✅ Removed `{phone}` from whitelist.", parse_mode="Markdown")
+    else:
+        await update.message.reply_text(f"❌ `{phone}` not found in whitelist.", parse_mode="Markdown")
+
+
+async def cmd_clearusers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin clears all allowed users."""
+    if not await is_admin_full(update.effective_user.id):
+        await update.message.reply_text("❌ Admin only.")
+        return
+    await db.clear_allowed_users()
+    await update.message.reply_text("✅ All users cleared from whitelist.")
+
+
 async def cmd_adotp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin gets OTP for any account by ID. Usage: /adotp <account_id>"""
     if not await is_admin_full(update.effective_user.id):
@@ -1006,6 +1165,15 @@ async def cmd_clist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  └ Usage: `/resetaccount user@example.com`\n"
         "`/remove <id>` — Permanently delete an account\n"
         "  └ Usage: `/remove user@example.com`\n\n"
+        "👥 *User Whitelist*\n"
+        "`/uploadusers` — Upload Excel with allowed phone numbers\n"
+        "  └ Send `.xlsx` after running — Columns: Phone | Name\n"
+        "`/listusers` — View all whitelisted users\n"
+        "`/adduser <phone> <name>` — Add a single user\n"
+        "  └ Usage: `/adduser +919876543210 Rahul Sharma`\n"
+        "`/removeuser <phone>` — Remove a user from whitelist\n"
+        "  └ Usage: `/removeuser +919876543210`\n"
+        "`/clearusers` — Remove ALL users from whitelist\n\n"
         "🔐 *OTP*\n"
         "`/adotp <account_id>` — Get OTP for any account\n"
         "  └ Usage: `/adotp user@example.com`\n\n"
@@ -1184,6 +1352,11 @@ def main():
     app.add_handler(CommandHandler("resetaccount", cmd_resetaccount))
     app.add_handler(CommandHandler("remove", cmd_remove))
     app.add_handler(CommandHandler("adotp", cmd_adotp))
+    app.add_handler(CommandHandler("uploadusers", cmd_uploadusers))
+    app.add_handler(CommandHandler("listusers", cmd_listusers))
+    app.add_handler(CommandHandler("adduser", cmd_adduser))
+    app.add_handler(CommandHandler("removeuser", cmd_removeuser))
+    app.add_handler(CommandHandler("clearusers", cmd_clearusers))
     app.add_handler(CommandHandler("addadmin", cmd_addadmin))
     app.add_handler(CommandHandler("removeadmin", cmd_removeadmin))
     app.add_handler(CommandHandler("admins", cmd_admins))
