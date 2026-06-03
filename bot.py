@@ -460,69 +460,103 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Create withdrawal record
     withdrawal_id = await db.create_withdrawal(user_id, account["account_id"])
 
-    # Ask for transaction ID
+    # Ask for screenshot
     context.user_data["pending_withdrawal_id"] = withdrawal_id
-    context.user_data["waiting_for_txn"] = True
+    context.user_data["waiting_for_screenshot"] = True
 
     await update.message.reply_text(
         f"✅ *Withdrawal Request Started*\n\n"
         f"Please withdraw your earnings to this wallet:\n\n"
         f"🌐 *Network:* `{wallet['network']}`\n"
         f"💳 *Wallet Address:*\n`{wallet['address']}`\n\n"
-        f"After sending, reply with your *Transaction ID / TXN Hash* so admin can verify.",
+        f"📸 After sending, *send a screenshot* of your withdrawal confirmation so admin can verify.",
         parse_mode="Markdown"
     )
 
 
-async def handle_txn_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle transaction ID submitted by user after /done."""
-    if not context.user_data.get("waiting_for_txn"):
+async def handle_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle screenshot submitted by user after /done."""
+    if not context.user_data.get("waiting_for_screenshot"):
         return
 
     user_id = update.effective_user.id
-    txn_id = update.message.text.strip()
     withdrawal_id = context.user_data.get("pending_withdrawal_id")
 
     if not withdrawal_id:
         return
 
-    await db.update_withdrawal_txn(withdrawal_id, txn_id)
-    context.user_data["waiting_for_txn"] = False
+    # Must be a photo
+    if not update.message.photo:
+        await update.message.reply_text(
+            "📸 Please send a *screenshot* (photo) of your withdrawal confirmation.",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Get highest quality photo
+    file_id = update.message.photo[-1].file_id
+    caption = update.message.caption or ""
+
+    await db.update_withdrawal_screenshot(withdrawal_id, file_id)
+    if caption:
+        await db.update_withdrawal_txn(withdrawal_id, caption)
+
+    context.user_data["waiting_for_screenshot"] = False
     context.user_data["pending_withdrawal_id"] = None
 
     account = await db.get_user_account(user_id)
+    user = update.effective_user
+    username = f"@{user.username}" if user.username else f"ID: {user_id}"
 
-    # Notify all admins
-    all_admin_ids = list(ADMIN_IDS)
-    db_admins = await db.get_admins()
-    for a in db_admins:
-        if a["user_id"] not in all_admin_ids:
-            all_admin_ids.append(a["user_id"])
+    # Notify group if set, else notify all admins
+    notify_group_id = await db.get_notify_group_chat_id()
+    notification_text = (
+        f"🔔 *New Withdrawal Request*\n\n"
+        f"Request ID: `#{withdrawal_id}`\n"
+        f"👤 User: {username} (`{user_id}`)\n"
+        f"🆔 Account: `{account['account_id'] if account else 'N/A'}`\n"
+        f"📝 Caption: {caption or 'None'}\n\n"
+        f"Use:\n"
+        f"`/approve {withdrawal_id}` — Approve & free account\n"
+        f"`/reject {withdrawal_id} [reason]` — Reject request"
+    )
 
-    for admin_id in all_admin_ids:
+    sent_to_group = False
+    if notify_group_id:
         try:
-            await context.bot.send_message(
-                chat_id=admin_id,
-                text=(
-                    f"🔔 *New Withdrawal Request*\n\n"
-                    f"Request ID: `#{withdrawal_id}`\n"
-                    f"User ID: `{user_id}`\n"
-                    f"Account: `{account['account_id'] if account else 'N/A'}`\n"
-                    f"TXN ID: `{txn_id}`\n\n"
-                    f"Use:\n"
-                    f"`/approve {withdrawal_id}` — Approve & free account\n"
-                    f"`/reject {withdrawal_id} [reason]` — Reject request"
-                ),
+            await context.bot.send_photo(
+                chat_id=notify_group_id,
+                photo=file_id,
+                caption=notification_text,
                 parse_mode="Markdown"
             )
-        except Exception:
-            pass
+            sent_to_group = True
+        except Exception as e:
+            logger.warning(f"Could not send to group {notify_group_id}: {e}")
+
+    if not sent_to_group:
+        # Fallback to all admins
+        all_admin_ids = list(ADMIN_IDS)
+        db_admins = await db.get_admins()
+        for a in db_admins:
+            if a["user_id"] not in all_admin_ids:
+                all_admin_ids.append(a["user_id"])
+
+        for admin_id in all_admin_ids:
+            try:
+                await context.bot.send_photo(
+                    chat_id=admin_id,
+                    photo=file_id,
+                    caption=notification_text,
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
 
     await update.message.reply_text(
         f"✅ *Withdrawal request submitted!*\n\n"
-        f"Request ID: `#{withdrawal_id}`\n"
-        f"TXN ID: `{txn_id}`\n\n"
-        f"Admin will verify and process your request shortly. "
+        f"Request ID: `#{withdrawal_id}`\n\n"
+        f"Admin will verify your screenshot and process the request shortly.\n"
         f"Your account will be released after approval.",
         parse_mode="Markdown"
     )
@@ -940,12 +974,129 @@ async def cmd_adcm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_clist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Full command list with usage — admin section visible to admins only."""
+    user_section = (
+        "📜 *Full Command List*\n\n"
+        "👤 *User Commands*\n\n"
+        "`/start` — Welcome message\n"
+        "`/getaccount` — Request an account\n"
+        "  └ Bot will ask for your mobile number first\n"
+        "`/myotp` — View your one-time OTP code\n"
+        "  └ Can only be used once per account\n"
+        "`/myaccount` — View your assigned account details\n"
+        "`/done` — Signal you're done & request withdrawal\n"
+        "  └ Bot shows wallet address to send to\n"
+        "  └ Send a screenshot of your withdrawal\n"
+        "`/adcm` — View admin contact info\n"
+        "`/help` — Quick command overview\n"
+        "`/clist` — This full command list"
+    )
+
+    admin_section = (
+        "\n\n👑 *Admin Commands*\n\n"
+        "📤 *Account Management*\n"
+        "`/upload` — Upload Excel file with accounts\n"
+        "  └ Send `.xlsx` after running this command\n"
+        "  └ Columns: ID | Password | TOTP Secret | Status\n"
+        "`/list` — View all accounts and their status\n"
+        "`/stats` — Quick account count summary\n"
+        "`/reset` — Mark ALL accounts as available\n"
+        "`/resetaccount <id>` — Reset one specific account\n"
+        "  └ Usage: `/resetaccount user@example.com`\n"
+        "`/remove <id>` — Permanently delete an account\n"
+        "  └ Usage: `/remove user@example.com`\n\n"
+        "🔐 *OTP*\n"
+        "`/adotp <account_id>` — Get OTP for any account\n"
+        "  └ Usage: `/adotp user@example.com`\n\n"
+        "💸 *Withdrawals*\n"
+        "`/withdrawals` — View all pending withdrawal requests\n"
+        "`/approve <id> [note]` — Approve withdrawal & free account\n"
+        "  └ Usage: `/approve 5` or `/approve 5 Payment confirmed`\n"
+        "`/reject <id> [reason]` — Reject a withdrawal request\n"
+        "  └ Usage: `/reject 5 Invalid screenshot`\n\n"
+        "💳 *Wallets*\n"
+        "`/setwallet <address> <network> [label]` — Add wallet\n"
+        "  └ Usage: `/setwallet TRxxxxxxx USDT_TRC20 MainWallet`\n"
+        "`/wallets` — View all saved withdrawal wallets\n\n"
+        "🔔 *Notifications*\n"
+        "`/setgroup` — Set this group for withdrawal alerts\n"
+        "  └ Run this command *inside* your admin group\n"
+        "`/getgroup` — View current notification group\n\n"
+        "⚙️ *Settings*\n"
+        "`/adcm <telegram> <phone> [note]` — Set admin contact\n"
+        "  └ Usage: `/adcm @admin +91999999 9am-9pm IST`\n\n"
+        "👑 *Admin Management*\n"
+        "`/addadmin <user_id>` — Add a new admin\n"
+        "  └ Usage: `/addadmin 123456789`\n"
+        "`/removeadmin <user_id>` — Remove a DB admin\n"
+        "  └ Usage: `/removeadmin 123456789`\n"
+        "`/admins` — List all current admins"
+    )
+
+    text = user_section
+    if await is_admin_full(update.effective_user.id):
+        text += admin_section
+
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def cmd_setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin sets the group for withdrawal notifications. Run this inside the group."""
+    if not await is_admin_full(update.effective_user.id):
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await update.message.reply_text(
+            "❌ Run this command *inside the group* you want notifications sent to.\n\n"
+            "Steps:\n"
+            "1. Add this bot to your admin group\n"
+            "2. Run `/setgroup` inside that group",
+            parse_mode="Markdown"
+        )
+        return
+
+    await db.set_notify_group_id(chat.id)
+    await update.message.reply_text(
+        f"✅ *Notification group set!*\n\n"
+        f"Group: *{chat.title}*\n"
+        f"ID: `{chat.id}`\n\n"
+        f"All withdrawal requests will now be sent here.",
+        parse_mode="Markdown"
+    )
+
+
+async def cmd_getgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin checks the current notification group."""
+    if not await is_admin_full(update.effective_user.id):
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    group_id = await db.get_notify_group_chat_id()
+    if not group_id:
+        await update.message.reply_text(
+            "⚠️ No notification group set.\n"
+            "Go to your admin group and run `/setgroup`.",
+            parse_mode="Markdown"
+        )
+        return
+
+    await update.message.reply_text(
+        f"✅ Notifications are sent to group ID: `{group_id}`\n\n"
+        f"To change it, run `/setgroup` inside a different group.",
+        parse_mode="Markdown"
+    )
+
+
 async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Route text input to the right handler based on user state."""
     if context.user_data.get("waiting_for_mobile"):
         await handle_mobile_number(update, context)
     elif context.user_data.get("waiting_for_txn"):
-        await handle_txn_id(update, context)
+        # Legacy fallback — should not normally be reached
+        pass
 
 
 # --- App Setup ---
@@ -962,7 +1113,8 @@ async def post_init(application: Application):
         BotCommand("myaccount", "View your account details"),
         BotCommand("done", "Withdraw earnings & release account"),
         BotCommand("adcm", "Contact admin for help"),
-        BotCommand("help", "Show all commands"),
+        BotCommand("help", "Quick command overview"),
+        BotCommand("clist", "Full command list with usage"),
     ]
     await application.bot.set_my_commands(user_cmds)
 
@@ -979,6 +1131,8 @@ async def post_init(application: Application):
         BotCommand("reject", "Reject a withdrawal request"),
         BotCommand("setwallet", "Set withdrawal wallet address"),
         BotCommand("wallets", "View all withdrawal wallets"),
+        BotCommand("setgroup", "Set group for withdrawal notifications"),
+        BotCommand("getgroup", "View current notification group"),
         BotCommand("addadmin", "Add a new admin"),
         BotCommand("removeadmin", "Remove an admin"),
         BotCommand("admins", "List all admins"),
@@ -1015,6 +1169,7 @@ def main():
     # User commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("clist", cmd_clist))
     app.add_handler(CommandHandler("getaccount", cmd_getaccount))
     app.add_handler(CommandHandler("myotp", cmd_myotp))
     app.add_handler(CommandHandler("myaccount", cmd_myaccount))
@@ -1037,11 +1192,16 @@ def main():
     app.add_handler(CommandHandler("withdrawals", cmd_withdrawals))
     app.add_handler(CommandHandler("setwallet", cmd_setwallet))
     app.add_handler(CommandHandler("wallets", cmd_wallets))
+    app.add_handler(CommandHandler("setgroup", cmd_setgroup))
+    app.add_handler(CommandHandler("getgroup", cmd_getgroup))
 
     # File upload handler
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
-    # TXN ID handler (text messages from users waiting after /done)
+    # Photo handler for withdrawal screenshots
+    app.add_handler(MessageHandler(filters.PHOTO, handle_screenshot))
+
+    # Text input handler (mobile number collection)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)

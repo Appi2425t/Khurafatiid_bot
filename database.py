@@ -34,6 +34,7 @@ class Database:
                     user_id INTEGER NOT NULL,
                     account_id TEXT NOT NULL,
                     txn_id TEXT,
+                    screenshot_file_id TEXT,
                     status TEXT DEFAULT 'pending',
                     requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     processed_at TIMESTAMP,
@@ -57,6 +58,12 @@ class Database:
                     phone TEXT,
                     note TEXT,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS notify_group (
+                    id INTEGER PRIMARY KEY,
+                    chat_id INTEGER NOT NULL
                 )
             """)
             await db.commit()
@@ -196,8 +203,7 @@ class Database:
             cols = [row[1] for row in await cursor.fetchall()]
             if "otp_shown" not in cols:
                 await db.execute("ALTER TABLE accounts ADD COLUMN otp_shown INTEGER DEFAULT 0")
-            cursor = await db.execute("PRAGMA table_info(withdraw_wallets)")
-            cols = [row[1] for row in await cursor.fetchall()]
+
             # check admin_contact table exists
             cursor = await db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='admin_contact'")
             if not await cursor.fetchone():
@@ -210,6 +216,23 @@ class Database:
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
+
+            # check notify_group table exists
+            cursor = await db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='notify_group'")
+            if not await cursor.fetchone():
+                await db.execute("""
+                    CREATE TABLE IF NOT EXISTS notify_group (
+                        id INTEGER PRIMARY KEY,
+                        chat_id INTEGER NOT NULL
+                    )
+                """)
+
+            # check withdrawals screenshot column
+            cursor = await db.execute("PRAGMA table_info(withdrawals)")
+            cols = [row[1] for row in await cursor.fetchall()]
+            if "screenshot_file_id" not in cols:
+                await db.execute("ALTER TABLE withdrawals ADD COLUMN screenshot_file_id TEXT")
+
             await db.commit()
 
     # --- Withdraw Wallets ---
@@ -261,6 +284,20 @@ class Database:
                 (txn_id, withdrawal_id)
             )
             await db.commit()
+
+    async def update_withdrawal_screenshot(self, withdrawal_id: int, file_id: str):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE withdrawals SET screenshot_file_id = ? WHERE id = ?",
+                (file_id, withdrawal_id)
+            )
+            await db.commit()
+
+    async def get_notify_group_chat_id(self) -> int:
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("SELECT chat_id FROM notify_group WHERE id = 1")
+            row = await cursor.fetchone()
+            return row[0] if row else None
 
     async def get_pending_withdrawals(self) -> list:
         async with aiosqlite.connect(self.db_path) as db:
@@ -322,3 +359,13 @@ class Database:
             cursor = await db.execute("SELECT * FROM admin_contact WHERE id = 1")
             row = await cursor.fetchone()
             return dict(row) if row else None
+
+    # --- Notification Group ---
+    async def set_notify_group_id(self, chat_id: int):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """INSERT INTO notify_group (id, chat_id) VALUES (1, ?)
+                   ON CONFLICT(id) DO UPDATE SET chat_id = ?""",
+                (chat_id, chat_id)
+            )
+            await db.commit()
