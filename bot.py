@@ -304,14 +304,11 @@ async def cmd_getaccount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Check if user already has an account
     existing = await db.get_user_account(user_id)
     if existing:
-        otp, remaining = generate_otp(existing["totp_secret"])
         await update.message.reply_text(
             f"ℹ️ You already have an assigned account.\n\n"
             f"🆔 *Account ID:* `{existing['account_id']}`\n"
-            f"🔑 *Password:* `{existing['password']}`\n"
-            f"🔐 *OTP Code:* `{otp}`\n"
-            f"⏱ *Expires in:* {remaining}s\n\n"
-            f"Use /myotp to get a fresh OTP anytime.",
+            f"🔑 *Password:* `{existing['password']}`\n\n"
+            f"Use /myotp if you need your OTP code.",
             parse_mode="Markdown"
         )
         return
